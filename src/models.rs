@@ -86,6 +86,7 @@ pub struct Exercise {
     pub notes: Option<String>,
     pub exercise_template_id: Option<String>,
     pub supersets_id: Option<f64>,
+    #[serde(default)]
     pub sets: Vec<Set>,
 }
 
@@ -107,6 +108,7 @@ pub struct RoutineExercise {
     pub notes: Option<String>,
     pub exercise_template_id: Option<String>,
     pub supersets_id: Option<f64>,
+    #[serde(default)]
     pub sets: Vec<RoutineSet>,
 }
 
@@ -136,6 +138,7 @@ pub struct Workout {
     pub end_time: Option<String>,
     pub updated_at: Option<String>,
     pub created_at: Option<String>,
+    #[serde(default)]
     pub exercises: Vec<Exercise>,
 }
 
@@ -202,6 +205,7 @@ pub struct Routine {
     pub folder_id: Option<f64>,
     pub updated_at: Option<String>,
     pub created_at: Option<String>,
+    #[serde(default)]
     pub exercises: Vec<RoutineExercise>,
 }
 
