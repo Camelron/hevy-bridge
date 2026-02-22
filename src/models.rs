@@ -361,3 +361,13 @@ pub struct UserInfo {
 pub struct UserInfoResponse {
     pub data: UserInfo,
 }
+
+// ──────────────────────────────────────────────
+// Webhook
+// ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookPayload {
+    #[serde(alias = "workoutId")]
+    pub workout_id: String,
+}

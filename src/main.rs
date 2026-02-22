@@ -197,6 +197,27 @@ enum Commands {
     /// progression over time.
     #[command(subcommand)]
     History(HistoryCommands),
+
+    /// Process a webhook workout payload and print a summary table.
+    ///
+    /// Accepts the JSON payload from a Hevy webhook (e.g. from a
+    /// workout.completed event), fetches the full workout, and prints
+    /// a human-readable table summarizing each exercise.
+    ///
+    /// Columns: Exercise, Sets, Best Weight (lbs), Reps @ Best, Result
+    ///
+    /// Result classification (based on reps at the heaviest set):
+    ///   Struggled  — fewer than 8 reps
+    ///   Succeeded  — 8 to 10 reps
+    ///   Exceeded   — 11 or more reps
+    ///
+    /// Example:
+    ///   hevy-bridge process-workout --json '{"workoutId":"ae4f95df-..."}'
+    ProcessWorkout {
+        /// Raw JSON webhook payload containing a "workoutId" field.
+        #[arg(long)]
+        json: String,
+    },
 }
 
 // ── Config ────────────────────────────────────────────
@@ -733,7 +754,275 @@ async fn main() -> Result<()> {
                 }
             }
         }
+
+        // ── Process Workout ───────────────
+        Commands::ProcessWorkout { json } => {
+            let payload: WebhookPayload = serde_json::from_str(&json)
+                .context("Invalid webhook JSON. Expected: {\"workoutId\":\"<UUID>\"}")?;
+
+            let api_key = resolve_api_key(&cli.api_key)?;
+            let client = HevyClient::new(api_key);
+            let workout = client.get_workout(&payload.workout_id).await?;
+
+            // If the workout is based on a routine, fetch it for per-set targets
+            let routine = if let Some(ref routine_id) = workout.routine_id {
+                client.get_routine(routine_id).await.ok().map(|r| r.routine)
+            } else {
+                None
+            };
+
+            // Build a per-set lookup: (exercise_template_id, set_index) -> (lo, hi)
+            let mut set_targets: std::collections::HashMap<(String, usize), (i64, i64)> =
+                std::collections::HashMap::new();
+            if let Some(ref r) = routine {
+                for ex in &r.exercises {
+                    if let Some(ref tmpl_id) = ex.exercise_template_id {
+                        for (i, s) in ex.sets.iter().enumerate() {
+                            let (lo, hi) = if let Some(ref range) = s.rep_range {
+                                let lo = range.start.map(|v| v as i64).unwrap_or(8);
+                                let hi = range.end.map(|v| v as i64).unwrap_or(lo);
+                                (lo, hi)
+                            } else {
+                                let r = s.reps.map(|v| v as i64).unwrap_or(10);
+                                (r.saturating_sub(1), r + 1)
+                            };
+                            set_targets.insert((tmpl_id.clone(), i), (lo, hi));
+                        }
+                    }
+                }
+            }
+
+            let title = workout.title.as_deref().unwrap_or("Untitled Workout");
+            println!();
+            println!("  {title}");
+            println!("  {}", "─".repeat(title.len()));
+            if let Some(ref routine_id) = workout.routine_id {
+                println!("  Routine ID: {routine_id}");
+            }
+            println!();
+
+            // ── Routine table (printed first when available) ──
+            if let Some(ref routine) = routine {
+                let routine_title = routine.title.as_deref().unwrap_or("Untitled Routine");
+
+                println!("  Routine: {routine_title}");
+                println!("  {}", "─".repeat(routine_title.len() + 10));
+                println!();
+
+                println!(
+                    "  {:<35} {:>5} {:>18} {:>12} {:>12}   {}",
+                    "Exercise", "Sets", "Target Wt (lbs)", "Target Reps", "Rest (s)", "Notes"
+                );
+                println!("  {}", "─".repeat(120));
+
+                for exercise in &routine.exercises {
+                    let ex_title = exercise
+                        .title
+                        .as_deref()
+                        .unwrap_or("Unknown Exercise");
+                    let notes = exercise.notes.as_deref().unwrap_or("");
+                    let num_sets = exercise.sets.len();
+
+                    let rest = exercise
+                        .rest_seconds
+                        .as_ref()
+                        .and_then(|v| v.as_f64())
+                        .map(|v| format!("{}", v as i64))
+                        .unwrap_or_else(|| "—".to_string());
+
+                    // Show the heaviest target weight and its rep range
+                    let (best_kg, reps_display) = exercise
+                        .sets
+                        .iter()
+                        .map(|s| {
+                            let w = s.weight_kg.unwrap_or(0.0);
+                            let rep_str = if let Some(ref range) = s.rep_range {
+                                let lo = range.start.map(|v| v as i64);
+                                let hi = range.end.map(|v| v as i64);
+                                match (lo, hi) {
+                                    (Some(l), Some(h)) => format!("{l}-{h}"),
+                                    (Some(l), None) => format!("{l}+"),
+                                    _ => s.reps.map(|r| format!("{}", r as i64)).unwrap_or_else(|| "—".to_string()),
+                                }
+                            } else {
+                                s.reps.map(|r| format!("{}", r as i64)).unwrap_or_else(|| "—".to_string())
+                            };
+                            (w, rep_str)
+                        })
+                        .fold((0.0_f64, "—".to_string()), |(bw, br), (w, r)| {
+                            if w > bw { (w, r) } else { (bw, br) }
+                        });
+
+                    let best_lbs = best_kg * 2.20462;
+                    let weight_str = if best_kg > 0.0 {
+                        format!("{best_lbs:.1}")
+                    } else {
+                        "—".to_string()
+                    };
+
+                    println!(
+                        "  {:<35} {:>5} {:>18} {:>12} {:>12}   {}",
+                        truncate_str(ex_title, 35),
+                        num_sets,
+                        weight_str,
+                        reps_display,
+                        rest,
+                        notes
+                    );
+
+                    // Indented per-set detail rows
+                    for (i, s) in exercise.sets.iter().enumerate() {
+                        let set_num = i + 1;
+                        let set_label = format!(
+                            "  Set {set_num}{}",
+                            s.set_type
+                                .as_ref()
+                                .map(|t| format!(" ({t})"))
+                                .unwrap_or_default()
+                        );
+                        let w_lbs = s.weight_kg.unwrap_or(0.0) * 2.20462;
+                        let rep_str = if let Some(ref range) = s.rep_range {
+                            let lo = range.start.map(|v| v as i64);
+                            let hi = range.end.map(|v| v as i64);
+                            match (lo, hi) {
+                                (Some(l), Some(h)) => format!("{l}-{h}"),
+                                (Some(l), None) => format!("{l}+"),
+                                _ => s.reps.map(|r| format!("{}", r as i64)).unwrap_or_else(|| "—".to_string()),
+                            }
+                        } else {
+                            s.reps.map(|r| format!("{}", r as i64)).unwrap_or_else(|| "—".to_string())
+                        };
+                        let w_str = if s.weight_kg.unwrap_or(0.0) > 0.0 {
+                            format!("{w_lbs:.1}")
+                        } else {
+                            "—".to_string()
+                        };
+                        println!(
+                            "  {:<35} {:>5} {:>18} {:>12} {:>12}   {}",
+                            set_label,
+                            "",
+                            w_str,
+                            rep_str,
+                            "",
+                            ""
+                        );
+                    }
+                }
+
+                println!();
+            }
+
+            // ── Workout results table ──
+            println!(
+                "  {:<35} {:>5} {:>18} {:>13} {:>12}   {}",
+                "Exercise", "Sets", "Weight (lbs)", "Reps", "Result", "Notes"
+            );
+            println!("  {}", "─".repeat(120));
+
+            for exercise in &workout.exercises {
+                let ex_title = exercise
+                    .title
+                    .as_deref()
+                    .unwrap_or("Unknown Exercise");
+                let notes = exercise.notes.as_deref().unwrap_or("");
+                let num_sets = exercise.sets.len();
+
+                // Compute an overall result: worst individual set classification wins
+                let mut has_struggled = false;
+                let mut all_exceeded = true;
+                for (i, s) in exercise.sets.iter().enumerate() {
+                    let reps = s.reps.map(|v| v as i64).unwrap_or(0);
+                    let (lo, hi) = exercise
+                        .exercise_template_id
+                        .as_ref()
+                        .and_then(|id| set_targets.get(&(id.clone(), i)))
+                        .copied()
+                        .unwrap_or((8, 10));
+                    if reps < lo {
+                        has_struggled = true;
+                        all_exceeded = false;
+                    } else if reps <= hi {
+                        all_exceeded = false;
+                    }
+                }
+                let overall = if has_struggled {
+                    "\x1b[33mStruggled\x1b[0m"
+                } else if all_exceeded {
+                    "\x1b[36mExceeded\x1b[0m"
+                } else {
+                    "\x1b[32mSucceeded\x1b[0m"
+                };
+
+                // Exercise summary row (no weight/reps — those are on the set rows)
+                println!(
+                    "  {:<35} {:>5} {:>18} {:>13} {:>21}   {}",
+                    truncate_str(ex_title, 35),
+                    num_sets,
+                    "",
+                    "",
+                    overall,
+                    notes
+                );
+
+                // Indented per-set detail rows with individual results
+                for (i, s) in exercise.sets.iter().enumerate() {
+                    let set_num = i + 1;
+                    let set_label = format!(
+                        "  Set {set_num}{}",
+                        s.set_type
+                            .as_ref()
+                            .map(|t| format!(" ({t})"))
+                            .unwrap_or_default()
+                    );
+                    let w_lbs = s.weight_kg.unwrap_or(0.0) * 2.20462;
+                    let reps = s.reps.map(|v| v as i64);
+
+                    let (lo, hi) = exercise
+                        .exercise_template_id
+                        .as_ref()
+                        .and_then(|id| set_targets.get(&(id.clone(), i)))
+                        .copied()
+                        .unwrap_or((8, 10));
+
+                    let r = reps.unwrap_or(0);
+                    let result = if r < lo {
+                        "\x1b[33mStruggled\x1b[0m"
+                    } else if r <= hi {
+                        "\x1b[32mSucceeded\x1b[0m"
+                    } else {
+                        "\x1b[36mExceeded\x1b[0m"
+                    };
+
+                    let rpe_str = s
+                        .rpe
+                        .map(|v| format!("RPE {v}"))
+                        .unwrap_or_default();
+
+                    println!(
+                        "  {:<35} {:>5} {:>18.1} {:>13} {:>21}   {}",
+                        set_label,
+                        "",
+                        w_lbs,
+                        reps.map(|v| v.to_string()).unwrap_or_else(|| "—".to_string()),
+                        result,
+                        rpe_str
+                    );
+                }
+            }
+
+            println!();
+        }
     }
 
     Ok(())
+}
+
+/// Truncate a string to `max` characters, appending "…" if shortened.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max - 1).collect();
+        format!("{truncated}…")
+    }
 }
